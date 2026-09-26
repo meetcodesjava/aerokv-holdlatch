@@ -123,6 +123,9 @@ public class AeroServer {
                 else if (AeroCommand.MHOLD.equals(command)) {
                     handleMultiHold(line, firstComma, out);
                 }
+                else if (AeroCommand.RELEASE_IF.equals(command)) {
+                    handleReleaseIf(line, firstComma, out);
+                }
                 else if (AeroCommand.RELEASE.equals(command)) {
                     String key = line.substring(firstComma + 1).trim();
                     cache.release(key);
@@ -249,6 +252,25 @@ public class AeroServer {
         respondToHoldResult(result, () -> {
             for (String key : keys) wal.logPut(key, val, expiresAtMillis);
         }, out);
+    }
+
+    // RELEASEIF,key,owner — deletes the key only if its current value is owner.
+    private void handleReleaseIf(String line, int firstComma, PrintWriter out) {
+        int secondComma = line.indexOf(',', firstComma + 1);
+        if (secondComma == -1) {
+            out.println("ERR_SYNTAX_ERROR");
+            out.flush();
+            return;
+        }
+        String key = line.substring(firstComma + 1, secondComma).trim();
+        String owner = line.substring(secondComma + 1).trim();
+        if (cache.releaseIfOwner(key, owner)) {
+            wal.logDelete(key);
+            out.println("OK");
+        } else {
+            out.println("ERR_NOT_HELD");
+        }
+        out.flush();
     }
 
     private void respondToHoldResult(HoldResult result, Runnable onAcquired, PrintWriter out) {

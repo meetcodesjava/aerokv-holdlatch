@@ -12,6 +12,7 @@ public final class AeroCommand {
     public static final String HOLD = "HOLD";
     public static final String MHOLD = "MHOLD";
     public static final String RELEASE = "RELEASE";
+    public static final String RELEASE_IF = "RELEASEIF";
     public static final String AUTH = "AUTH";
     public static final String PING = "PING";
 

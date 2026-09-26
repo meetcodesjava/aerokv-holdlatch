@@ -274,6 +274,30 @@ public class AeroConcurrentLRU {
         remove(key);
     }
 
+    /**
+     * Compare-and-delete: removes the key only if it is still live and its
+     * stored value equals owner. Stops a holder whose hold already expired
+     * (and was re-acquired by someone else) from releasing that new hold.
+     */
+    public boolean releaseIfOwner(String key, String owner) {
+        Object lock = lockManager.getLock(key);
+        synchronized (lock) {
+            synchronized (memoryLock) {
+                Object raw = cache.get(key);
+                if (!(raw instanceof CacheEntry)) {
+                    return false;
+                }
+                CacheEntry entry = (CacheEntry) raw;
+                if (entry.isExpired() || !owner.equals(String.valueOf(entry.value))) {
+                    return false;
+                }
+                totalBytes.addAndGet(-entry.sizeBytes);
+                cache.remove(key);
+                return true;
+            }
+        }
+    }
+
     /** Current best-effort total size, in bytes, of all live values. */
     public long getTotalBytes() {
         return totalBytes.get();

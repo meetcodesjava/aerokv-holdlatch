@@ -108,4 +108,28 @@ class AeroConcurrentLRUTest {
         }
         pool.shutdownNow();
     }
+
+    @Test
+    void releaseIfOwnerOnlyRemovesTheCallersOwnHold() throws Exception {
+        AeroConcurrentLRU cache = new AeroConcurrentLRU(10, 4);
+        cache.putIfAbsent("A1", "holdA", 60_000);
+
+        assertFalse(cache.releaseIfOwner("A1", "someone-else"));
+        assertEquals("holdA", cache.get("A1"));
+        assertFalse(cache.releaseIfOwner("missing", "holdA"));
+
+        assertTrue(cache.releaseIfOwner("A1", "holdA"));
+        assertNull(cache.get("A1"));
+    }
+
+    @Test
+    void lateReleaseCannotFreeAHoldThatWasReacquiredAfterExpiry() throws Exception {
+        AeroConcurrentLRU cache = new AeroConcurrentLRU(10, 4);
+        cache.putIfAbsent("A1", "oldHold", 50);
+        Thread.sleep(120);
+        assertEquals(HoldResult.ACQUIRED, cache.putIfAbsent("A1", "newHold", 60_000));
+
+        assertFalse(cache.releaseIfOwner("A1", "oldHold"));
+        assertEquals("newHold", cache.get("A1"));
+    }
 }
