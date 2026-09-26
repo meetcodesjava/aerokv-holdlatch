@@ -43,4 +43,24 @@ class AeroWALTest {
         // still a real hold, not permanent: a second acquire must conflict
         assertEquals(AeroConcurrentLRU.HoldResult.CONFLICT, cache.putIfAbsent("live", "x", 1000));
     }
+
+    @Test
+    void holdsComeBackPinnedAfterARestartAndSurviveCompaction(@TempDir Path dir) throws Exception {
+        File log = dir.resolve("wal.log").toFile();
+        long now = System.currentTimeMillis();
+        Files.writeString(log.toPath(), "HOLD,seat1,holderA," + (now + 60_000) + "\nSET,plain1,x,-1\n");
+
+        AeroConcurrentLRU cache = new AeroConcurrentLRU(2, 4);
+        AeroWAL wal = new AeroWAL(log.getPath());
+        wal.recover(cache);
+        wal.compact(cache);
+
+        assertTrue(Files.readString(log.toPath()).contains("HOLD,seat1,holderA,"), "compaction must keep the hold marked as a hold");
+
+        AeroConcurrentLRU second = new AeroConcurrentLRU(2, 4);
+        new AeroWAL(log.getPath()).recover(second);
+        second.put("n1", "1");
+        second.put("n2", "2");
+        assertEquals("holderA", second.get("seat1"));
+    }
 }

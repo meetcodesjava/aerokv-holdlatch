@@ -23,9 +23,12 @@ public class AeroConcurrentLRU {
         final Object value;
         final long expiresAtMillis;
         final long sizeBytes;
+        // Set only by HOLD/MHOLD (and their WAL replay). A pinned entry is a reservation: never evicted while live.
+        final boolean pinned;
 
-        CacheEntry(Object value, long ttlMillis) {
+        CacheEntry(Object value, long ttlMillis, boolean pinned) {
             this.value = value;
+            this.pinned = pinned;
             this.expiresAtMillis = (ttlMillis > 0) ? (System.currentTimeMillis() + ttlMillis) : -1;
             this.sizeBytes = String.valueOf(value).getBytes(StandardCharsets.UTF_8).length;
         }
@@ -33,13 +36,19 @@ public class AeroConcurrentLRU {
         boolean isExpired() {
             return expiresAtMillis != -1 && System.currentTimeMillis() > expiresAtMillis;
         }
+
+        /** A reservation that has not run out yet - the only kind of entry eviction must never take. */
+        boolean isLiveHold() {
+            return pinned && !isExpired();
+        }
     }
 
     /** One live entry as exposed to callers outside this class (WAL compaction). */
-    public record LiveEntry(String key, Object value, long expiresAtMillis) {}
+    public record LiveEntry(String key, Object value, long expiresAtMillis, boolean pinned) {}
 
+    // Ordinary cache entries (with or without a TTL) and expired holds may be evicted, oldest first; a live hold never is.
     private static boolean isEvictable(Object rawVal) {
-        return rawVal instanceof CacheEntry && ((CacheEntry) rawVal).isExpired();
+        return rawVal instanceof CacheEntry && !((CacheEntry) rawVal).isLiveHold();
     }
 
     private static long sizeOf(Object raw) {
@@ -78,7 +87,7 @@ public class AeroConcurrentLRU {
     public Object get(String key) {
         Object lock = lockManager.getLock(key);
         synchronized (lock) {
-            CacheEntry entry = (CacheEntry) cache.get(key);
+            CacheEntry entry = lookup(key);
             if (entry == null) {
                 return null;
             }
@@ -103,16 +112,25 @@ public class AeroConcurrentLRU {
     /**
      * Put with specific Time-To-Live in milliseconds. Enforces the total
      * byte budget (if configured) and the entry-count capacity, evicting
-     * least-recently-used entries first - but only ones that are already
-     * expired; a still-live entry is never evicted to make room. Returns
+     * least-recently-used entries first - but a live hold (an unexpired TTL
+     * entry) is never evicted to make room. Returns
      * false (without writing) if a brand-new key can't be admitted because
      * every entry in the cache is a live hold.
      */
     public boolean put(String key, Object val, long ttlMillis) {
+        return store(key, val, ttlMillis, false);
+    }
+
+    /** Like put, but the entry is a reservation: it is never evicted while it is live. Used when replaying holds from the WAL. */
+    public boolean putPinned(String key, Object val, long ttlMillis) {
+        return store(key, val, ttlMillis, true);
+    }
+
+    private boolean store(String key, Object val, long ttlMillis, boolean pinned) {
         Object lock = lockManager.getLock(key);
         synchronized (lock) {
             synchronized (memoryLock) {
-                CacheEntry newEntry = new CacheEntry(val, ttlMillis);
+                CacheEntry newEntry = new CacheEntry(val, ttlMillis, pinned);
                 CacheEntry existing = (CacheEntry) cache.get(key);
                 long oldSize = (existing != null) ? existing.sizeBytes : 0;
 
@@ -144,13 +162,13 @@ public class AeroConcurrentLRU {
     public HoldResult putIfAbsent(String key, Object val, long ttlMillis) {
         Object lock = lockManager.getLock(key);
         synchronized (lock) {
-            CacheEntry current = (CacheEntry) cache.get(key);
+            CacheEntry current = lookup(key);
             if (current != null && !current.isExpired()) {
                 return HoldResult.CONFLICT;
             }
             synchronized (memoryLock) {
                 long oldSize = (current != null) ? current.sizeBytes : 0;
-                CacheEntry newEntry = new CacheEntry(val, ttlMillis);
+                CacheEntry newEntry = new CacheEntry(val, ttlMillis, true);
 
                 if (maxTotalBytes > 0) {
                     long projected = totalBytes.get() - oldSize + newEntry.sizeBytes;
@@ -195,7 +213,7 @@ public class AeroConcurrentLRU {
 
         Supplier<HoldResult> action = () -> {
             for (String key : keys) {
-                CacheEntry current = (CacheEntry) cache.get(key);
+                CacheEntry current = lookup(key);
                 if (current != null && !current.isExpired()) {
                     return HoldResult.CONFLICT;
                 }
@@ -206,7 +224,7 @@ public class AeroConcurrentLRU {
                 for (String key : keys) {
                     CacheEntry existing = (CacheEntry) cache.get(key);
                     long oldSize = (existing != null) ? existing.sizeBytes : 0;
-                    CacheEntry newEntry = new CacheEntry(val, ttlMillis);
+                    CacheEntry newEntry = new CacheEntry(val, ttlMillis, true);
 
                     if (maxTotalBytes > 0) {
                         long projected = totalBytes.get() - oldSize + newEntry.sizeBytes;
@@ -298,6 +316,19 @@ public class AeroConcurrentLRU {
         }
     }
 
+    /**
+     * Every read of the shared LRU list goes through here. A read is not
+     * harmless: it moves the entry to the front of the list, so it must hold
+     * the same lock the writers hold. Stripe locks alone cannot protect one
+     * shared linked list - two threads on different stripes would rewire its
+     * pointers at the same time and corrupt it.
+     */
+    private CacheEntry lookup(String key) {
+        synchronized (memoryLock) {
+            return (CacheEntry) cache.get(key);
+        }
+    }
+
     /** Current best-effort total size, in bytes, of all live values. */
     public long getTotalBytes() {
         return totalBytes.get();
@@ -314,7 +345,7 @@ public class AeroConcurrentLRU {
         for (Map.Entry<String, Object> e : cache.snapshotEntries()) {
             CacheEntry ce = (CacheEntry) e.getValue();
             if (ce == null || ce.isExpired()) continue;
-            out.add(new LiveEntry(e.getKey(), ce.value, ce.expiresAtMillis));
+            out.add(new LiveEntry(e.getKey(), ce.value, ce.expiresAtMillis, ce.pinned));
         }
         return out;
     }

@@ -88,7 +88,11 @@ public class AeroWAL {
                     continue;
                 }
                 long remainingTtlMillis = (expiresAt == -1) ? -1 : (expiresAt - now);
-                cache.put(entry.getKey(), entry.getValue(), remainingTtlMillis);
+                if (entry.getOp() == AeroWALEntry.Op.HOLD) {
+                    cache.putPinned(entry.getKey(), entry.getValue(), remainingTtlMillis);
+                } else {
+                    cache.put(entry.getKey(), entry.getValue(), remainingTtlMillis);
+                }
                 count++;
             }
             System.out.println("Recovery Complete! Replayed " + count + " log entries into cache.");
@@ -115,7 +119,9 @@ public class AeroWAL {
 
         try(BufferedWriter writer=new BufferedWriter(new java.io.FileWriter(tmpFile, false))){
             for(AeroConcurrentLRU.LiveEntry e : cache.snapshotLiveEntries()){
-                writer.write(AeroWALEntry.set(e.key(), String.valueOf(e.value()), e.expiresAtMillis()).encode());
+                String value = String.valueOf(e.value());
+                writer.write((e.pinned() ? AeroWALEntry.hold(e.key(), value, e.expiresAtMillis())
+                                         : AeroWALEntry.set(e.key(), value, e.expiresAtMillis())).encode());
                 written++;
             }
         }
@@ -139,6 +145,11 @@ public class AeroWAL {
     /** Logs a SET carrying its absolute expiry timestamp (-1 = never expires). */
     public void logPut(String key, String value, long expiresAtMillis){
         enqueue(AeroWALEntry.set(key, value, expiresAtMillis).encode());
+    }
+
+    /** Logs a HOLD/MHOLD acquisition so replay after a restart keeps it pinned against eviction. */
+    public void logHold(String key, String value, long expiresAtMillis){
+        enqueue(AeroWALEntry.hold(key, value, expiresAtMillis).encode());
     }
 
     public void logDelete(String key){

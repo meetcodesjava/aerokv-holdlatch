@@ -132,4 +132,50 @@ class AeroConcurrentLRUTest {
         assertFalse(cache.releaseIfOwner("A1", "oldHold"));
         assertEquals("newHold", cache.get("A1"));
     }
+
+    @Test
+    void plainEntriesWithoutATtlAreStillEvictedOldestFirst() {
+        AeroConcurrentLRU cache = new AeroConcurrentLRU(2, 4);
+        assertTrue(cache.put("old", "1"));
+        assertTrue(cache.put("newer", "2"));
+        cache.get("old");
+        assertTrue(cache.put("newest", "3"));
+
+        assertNull(cache.get("newer"), "least recently used plain entry goes first");
+        assertEquals("1", cache.get("old"));
+        assertEquals("3", cache.get("newest"));
+    }
+
+    @Test
+    void aLiveHoldSurvivesWhileOrdinaryEntriesAreEvictedAroundIt() {
+        AeroConcurrentLRU cache = new AeroConcurrentLRU(2, 4);
+        assertEquals(HoldResult.ACQUIRED, cache.putIfAbsent("seat", "holder", 60_000));
+        assertTrue(cache.put("plain1", "x"));
+        assertTrue(cache.put("plain2", "y"));
+
+        assertEquals("holder", cache.get("seat"));
+        assertNull(cache.get("plain1"));
+    }
+
+    @Test
+    void setEntriesWithATtlAreOrdinaryCacheDataAndAreEvictedLikeAnyOther() {
+        AeroConcurrentLRU cache = new AeroConcurrentLRU(2, 4);
+        assertTrue(cache.put("a", "1", 120_000));
+        assertTrue(cache.put("b", "2", 120_000));
+        assertTrue(cache.put("c", "3", 120_000), "a TTL alone must not pin an entry; only a hold does");
+
+        assertNull(cache.get("a"));
+        assertEquals("3", cache.get("c"));
+    }
+
+    @Test
+    void aPinnedEntryRestoredFromTheLogStaysProtected() {
+        AeroConcurrentLRU cache = new AeroConcurrentLRU(2, 4);
+        assertTrue(cache.putPinned("seat", "holder", 60_000));
+        assertTrue(cache.put("x", "1"));
+        assertTrue(cache.put("y", "2"));
+
+        assertEquals("holder", cache.get("seat"));
+        assertNull(cache.get("x"));
+    }
 }

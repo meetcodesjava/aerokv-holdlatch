@@ -217,7 +217,7 @@ public class AeroServer {
         }
 
         HoldResult result = cache.putIfAbsent(key, val, ttl);
-        respondToHoldResult(result, () -> wal.logPut(key, val, expiresAt(ttl)), out);
+        respondToHoldResult(result, () -> wal.logHold(key, val, expiresAt(ttl)), out);
     }
 
     // MHOLD,key1|key2|key3,value,ttlMillis — all-or-nothing multi-key acquire.
@@ -250,7 +250,7 @@ public class AeroServer {
         HoldResult result = cache.holdAll(keys, val, ttl);
         long expiresAtMillis = expiresAt(ttl);
         respondToHoldResult(result, () -> {
-            for (String key : keys) wal.logPut(key, val, expiresAtMillis);
+            for (String key : keys) wal.logHold(key, val, expiresAtMillis);
         }, out);
     }
 

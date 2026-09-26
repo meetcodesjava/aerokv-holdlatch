@@ -8,7 +8,7 @@ import java.util.Optional;
  * writer and reader (recover/compact) can't drift apart.
  */
 public final class AeroWALEntry {
-    public enum Op { SET, DEL }
+    public enum Op { SET, HOLD, DEL }
 
     private final Op op;
     private final String key;
@@ -26,14 +26,21 @@ public final class AeroWALEntry {
         return new AeroWALEntry(Op.SET, key, value, expiresAtMillis);
     }
 
+    /** A reservation (HOLD/MHOLD): replayed as a pinned entry so a restart cannot make it evictable. */
+    public static AeroWALEntry hold(String key, String value, long expiresAtMillis) {
+        return new AeroWALEntry(Op.HOLD, key, value, expiresAtMillis);
+    }
+
     public static AeroWALEntry del(String key) {
         return new AeroWALEntry(Op.DEL, key, null, -1);
     }
 
     public String encode() {
-        return op == Op.SET
-            ? "SET," + key + "," + value + "," + expiresAtMillis + "\n"
-            : "DEL," + key + "\n";
+        return switch (op) {
+            case SET -> "SET," + key + "," + value + "," + expiresAtMillis + "\n";
+            case HOLD -> "HOLD," + key + "," + value + "," + expiresAtMillis + "\n";
+            case DEL -> "DEL," + key + "\n";
+        };
     }
 
     /** Empty if the line is blank, malformed, or an unrecognized op. */
@@ -45,7 +52,8 @@ public final class AeroWALEntry {
         if ("DEL".equalsIgnoreCase(op) && parts.length >= 2) {
             return Optional.of(del(parts[1].trim()));
         }
-        if (("SET".equalsIgnoreCase(op) || "PUT".equalsIgnoreCase(op)) && parts.length >= 4) {
+        boolean isHold = "HOLD".equalsIgnoreCase(op);
+        if ((isHold || "SET".equalsIgnoreCase(op) || "PUT".equalsIgnoreCase(op)) && parts.length >= 4) {
             String key = parts[1].trim();
             String value = parts[2].trim();
             long expiresAtMillis;
@@ -54,7 +62,7 @@ public final class AeroWALEntry {
             } catch (NumberFormatException e) {
                 expiresAtMillis = -1;
             }
-            return Optional.of(set(key, value, expiresAtMillis));
+            return Optional.of(isHold ? hold(key, value, expiresAtMillis) : set(key, value, expiresAtMillis));
         }
         return Optional.empty();
     }
