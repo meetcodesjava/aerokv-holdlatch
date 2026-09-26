@@ -434,3 +434,24 @@ Backend Developer | Java | Spring Boot | Data Structures & Algorithms | Concurre
 * **GitHub:** [github.com/meetcodesjava](https://github.com/meetcodesjava)
 * **LinkedIn:** [linkedin.com/in/meetlimbachiya](https://www.linkedin.com/in/meetlimbachiya/)
 * **Project Repository:** [AeroKV Repository](https://github.com/meetcodesjava/AeroKV)
+
+---
+
+## Additions in this fork (for HoldLatch)
+
+This fork keeps everything above and adds what a ticket-reservation service needs. Nothing here changes the behaviour of `SET`, `GET` or `DEL`.
+
+| Command | Meaning |
+|---|---|
+| `HOLD,key,owner,ttlMillis` | Atomic acquire: succeeds only if nobody holds `key`. Replies `OK`, `ERR_CONFLICT` or `ERR_CAPACITY`. |
+| `MHOLD,k1\|k2\|k3,owner,ttlMillis` | All-or-nothing acquire of several keys, safe against deadlock (stripes are locked in a fixed order). |
+| `RELEASE,key` | Unconditional delete. |
+| `RELEASEIF,key,owner` | Compare-and-delete: only releases if `owner` still holds it, so a late release can never free someone else's hold. Replies `OK` or `ERR_NOT_HELD`. |
+
+- **Holds are pinned.** Cache entries created with `SET` are ordinary cache data and are evicted least-recently-used first. Entries created by `HOLD`/`MHOLD` are never evicted while alive; if the cache is full of live holds a new hold gets `ERR_CAPACITY` instead of silently dropping someone's reservation.
+- **The write-ahead log keeps the countdown.** Each entry is logged with its absolute expiry time, so after a restart a hold resumes with its *remaining* time (already-expired ones are dropped), and holds come back pinned. Log compaction preserves both.
+- **Virtual threads** serve connections, so there is no fixed connection ceiling.
+- **Concurrency fix:** reads move an entry within the shared LRU list, so they now take the same lock as writers (a stress test that crashed the JVM before the fix runs clean).
+- **Container:** `docker build -t aerokv .` (the write-ahead log is on the `/data` volume).
+
+Configuration is by environment variable: `AEROKV_PORT`, `AEROKV_CAPACITY`, `AEROKV_STRIPES`, `AEROKV_LOG_PATH`, `AEROKV_MAX_MEMORY_BYTES`, `AEROKV_PASSWORD`.
