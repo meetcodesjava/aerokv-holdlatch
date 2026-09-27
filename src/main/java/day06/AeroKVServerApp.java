@@ -18,16 +18,15 @@ public class AeroKVServerApp {
         long maxTotalBytes = longConfig(arg(args, 4), "AEROKV_MAX_MEMORY_BYTES", 256L * 1024 * 1024);
         // No default password: auth is off unless explicitly configured.
         String password = strConfig(arg(args, 5), "AEROKV_PASSWORD", null);
-        int threadPoolSize = intConfig(arg(args, 6), "AEROKV_THREADS", 200);
 
         System.out.println("Starting AeroKV with port=" + port + ", capacity=" + cacheCapacity
                 + ", stripes=" + lockStripes + ", logFilePath=" + logFilePath
                 + ", maxTotalBytes=" + maxTotalBytes
                 + ", authRequired=" + (password != null && !password.isBlank())
-                + ", threadPoolSize=" + threadPoolSize);
+                + ", threading=virtual-thread-per-connection");
 
         try {
-            AeroServer server = new AeroServer(port, cacheCapacity, lockStripes, logFilePath, maxTotalBytes, password, threadPoolSize);
+            AeroServer server = new AeroServer(port, cacheCapacity, lockStripes, logFilePath, maxTotalBytes, password);
             // Without this, stop() is never called: Ctrl+C or a normal
             // process-kill would just end the JVM outright, dropping any
             // writes still sitting in the WAL queue and skipping the

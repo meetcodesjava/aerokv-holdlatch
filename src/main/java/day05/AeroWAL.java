@@ -51,6 +51,12 @@ public class AeroWAL {
     }
 
 
+    /**
+     * Replays the log into cache, restoring each SET with its remaining
+     * TTL rather than treating it as permanent - an entry whose absolute
+     * expiry has already passed by the time we recover is dropped instead
+     * of being resurrected.
+     */
     public void recover(AeroConcurrentLRU cache){
         File logFile=new File(logFilePath);
         if(!logFile.exists()){
@@ -60,27 +66,30 @@ public class AeroWAL {
 
         System.out.println("Recovering data from Write-Ahead Log (" + logFilePath + ")...");
         int count=0;
-
+        long now = System.currentTimeMillis();
 
         try(BufferedReader reader=new BufferedReader(new FileReader(logFile))){
             String line;
             while((line=reader.readLine()) != null){
-                String[] parts=line.split(",");
-                if(parts.length==0) continue;
-                String op = parts[0].trim();
+                var decoded = AeroWALEntry.decode(line);
+                if (decoded.isEmpty()) continue;
+                AeroWALEntry entry = decoded.get();
 
-                if(parts.length>=3 && ("PUT".equalsIgnoreCase(op) || "SET".equalsIgnoreCase(op))){
-                    String key=parts[1].trim();
-                    String val=parts[2].trim();
+                if (entry.getOp() == AeroWALEntry.Op.DEL) {
+                    cache.remove(entry.getKey());
+                    count++;
+                    continue;
+                }
 
-                    cache.put(key, new AeroTTLEntry(val, 0));
-                    count++;
+                long expiresAt = entry.getExpiresAtMillis();
+                if (expiresAt != -1 && expiresAt <= now) {
+                    // Already expired by the time we're recovering - drop it
+                    // rather than restore an entry that should be gone.
+                    continue;
                 }
-                else if(parts.length>=2 && "DEL".equalsIgnoreCase(op)){
-                    String key=parts[1].trim();
-                    cache.remove(key);
-                    count++;
-                }
+                long remainingTtlMillis = (expiresAt == -1) ? -1 : (expiresAt - now);
+                cache.put(entry.getKey(), entry.getValue(), remainingTtlMillis);
+                count++;
             }
             System.out.println("Recovery Complete! Replayed " + count + " log entries into cache.");
         }
@@ -91,9 +100,10 @@ public class AeroWAL {
 
     /**
      * Rewrites the log file to contain only the current live (non-expired)
-     * key-value pairs as a single SET per key, discarding the accumulated
-     * history of overwrites, deletes, and expired entries. Must run after
-     * recover() and before start(), while no writer thread holds the file.
+     * key-value pairs as a single SET per key (preserving each one's
+     * absolute expiry), discarding the accumulated history of overwrites,
+     * deletes, and expired entries. Must run after recover() and before
+     * start(), while no writer thread holds the file.
      */
     public void compact(AeroConcurrentLRU cache){
         File logFile=new File(logFilePath);
@@ -104,12 +114,8 @@ public class AeroWAL {
         int written = 0;
 
         try(BufferedWriter writer=new BufferedWriter(new java.io.FileWriter(tmpFile, false))){
-            for(java.util.Map.Entry<String, Object> e : cache.snapshotLiveEntries()){
-                Object rawVal = e.getValue();
-                String val = (rawVal instanceof AeroTTLEntry)
-                        ? String.valueOf(((AeroTTLEntry) rawVal).getValue())
-                        : String.valueOf(rawVal);
-                writer.write("SET," + e.getKey() + "," + val + "\n");
+            for(AeroConcurrentLRU.LiveEntry e : cache.snapshotLiveEntries()){
+                writer.write(AeroWALEntry.set(e.key(), String.valueOf(e.value()), e.expiresAtMillis()).encode());
                 written++;
             }
         }
@@ -130,12 +136,13 @@ public class AeroWAL {
     }
 
 
-    public void logPut(String key, Object value){
-        enqueue("SET," + key + "," + value + "\n");
+    /** Logs a SET carrying its absolute expiry timestamp (-1 = never expires). */
+    public void logPut(String key, String value, long expiresAtMillis){
+        enqueue(AeroWALEntry.set(key, value, expiresAtMillis).encode());
     }
 
     public void logDelete(String key){
-        enqueue("DEL," + key + "\n");
+        enqueue(AeroWALEntry.del(key).encode());
     }
 
     /**
@@ -162,7 +169,6 @@ public class AeroWAL {
                 if (first == SHUTDOWN_SIGNAL) break;
 
                 writer.write((String) first);
-                boolean wroteAny = true;
 
                 // Drain whatever else is already waiting so concurrent
                 // writes share one flush+fsync (group commit) instead of
@@ -176,13 +182,11 @@ public class AeroWAL {
                     writer.write((String) next);
                 }
 
-                if (wroteAny) {
-                    writer.flush();
-                    // Force the write to physical disk, not just the OS
-                    // buffer, so a completed write really survives a crash
-                    // or power loss right after the client got "OK".
-                    fos.getFD().sync();
-                }
+                writer.flush();
+                // Force the write to physical disk, not just the OS
+                // buffer, so a completed write really survives a crash
+                // or power loss right after the client got "OK".
+                fos.getFD().sync();
             }
         }
         catch(IOException|InterruptedException e){

@@ -16,8 +16,17 @@ public class AeroLockManager {
      * Maps a given key to a specific lock stripe using its hash code.
      */
     public Object getLock(String key) {
+        return locks[getStripeIndex(key)];
+    }
+
+    /** Stripe index a key hashes to - used to dedupe/order locks for multi-key operations. */
+    public int getStripeIndex(String key) {
         int hash = key.hashCode();
-        int stripeIndex = (hash % numStripes + numStripes) % numStripes;
+        return (hash % numStripes + numStripes) % numStripes;
+    }
+
+    /** Lock object for a given stripe index, for callers that already resolved indices (e.g. multi-key holds). */
+    public Object getLockByIndex(int stripeIndex) {
         return locks[stripeIndex];
     }
 }

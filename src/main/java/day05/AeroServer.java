@@ -1,11 +1,14 @@
 package day05;
 
 import day04.AeroConcurrentLRU;
+import day04.AeroConcurrentLRU.HoldResult;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -18,16 +21,11 @@ public class AeroServer {
     private final ServerSocket serverSocket;
     private final AeroConcurrentLRU cache;
     private final AeroWAL wal;
-    // One thread stays pinned to a connection for that connection's entire
-    // lifetime (see handleClient's while loop) — this is a thread-per-
-    // connection server, not an event-driven one. That means the pool size
-    // is a hard ceiling on concurrent connections, not just a performance
-    // tuning knob: if more clients connect at once than there are threads,
-    // the extra ones queue up, and combined with the idle-socket timeout
-    // above, a client that queues too long can have its own still-live
-    // connection closed by the server before ever getting serviced. Size
-    // this at least as large as the maximum number of clients you expect
-    // to have connected at the same time.
+    // Virtual threads: one per connection, for that connection's entire
+    // lifetime (see handleClient's while loop). Unlike a fixed platform-
+    // thread pool, this scales to many thousands of concurrently blocked
+    // socket connections without exhausting OS threads, so there's no
+    // fixed ceiling to size for expected concurrent clients anymore.
     private final ExecutorService threadPool;
     private volatile boolean running;
     // null/blank means "no password required" — every connection starts
@@ -35,20 +33,15 @@ public class AeroServer {
     private final String requiredPassword;
 
     public AeroServer(int port, int capacity, int numStripes, String logFilePath) throws IOException {
-        this(port, capacity, numStripes, logFilePath, 0, null, 200);
+        this(port, capacity, numStripes, logFilePath, 0, null);
     }
 
     public AeroServer(int port, int capacity, int numStripes, String logFilePath,
                        long maxTotalBytes, String requiredPassword) throws IOException {
-        this(port, capacity, numStripes, logFilePath, maxTotalBytes, requiredPassword, 200);
-    }
-
-    public AeroServer(int port, int capacity, int numStripes, String logFilePath,
-                       long maxTotalBytes, String requiredPassword, int threadPoolSize) throws IOException {
         this.serverSocket = new ServerSocket(port);
         this.cache = new AeroConcurrentLRU(capacity, numStripes, maxTotalBytes);
         this.wal = new AeroWAL(logFilePath);
-        this.threadPool = Executors.newFixedThreadPool(threadPoolSize);
+        this.threadPool = Executors.newVirtualThreadPerTaskExecutor();
         this.running = true;
         this.requiredPassword = (requiredPassword == null || requiredPassword.isBlank()) ? null : requiredPassword;
         // Order matters: recover() and compact() must both finish reading
@@ -66,15 +59,8 @@ public class AeroServer {
             try {
                 Socket clientSocket = serverSocket.accept();
                 // Idle timeout: an unused connection is closed to free its
-                // worker thread back to the pool eventually. 1 second (the
-                // original value) was far too aggressive: a client that is
-                // simply waiting its turn under load (e.g. many clients
-                // connecting to a small thread pool at once) could have its
-                // connection killed by the server before it ever got to
-                // send its next command, even though it was still a live,
-                // well-behaved client. 60 seconds is generous enough for a
-                // connection-pooling client to sit briefly idle between
-                // requests without being punished for it.
+                // virtual thread eventually, rather than sitting open
+                // forever against a client that vanished without closing.
                 clientSocket.setSoTimeout(60_000);
                 threadPool.submit(() -> handleClient(clientSocket));
             } catch (IOException e) {
@@ -99,7 +85,7 @@ public class AeroServer {
 
                 int firstComma = line.indexOf(',');
                 if (firstComma == -1) {
-                    if ("PING".equalsIgnoreCase(line)) {
+                    if (AeroCommand.PING.equalsIgnoreCase(line)) {
                         out.println("PONG");
                     } else {
                         out.println("ERR_INVALID_FORMAT");
@@ -110,7 +96,7 @@ public class AeroServer {
 
                 String command = line.substring(0, firstComma).trim().toUpperCase();
 
-                if ("AUTH".equals(command)) {
+                if (AeroCommand.AUTH.equals(command)) {
                     String suppliedPassword = line.substring(firstComma + 1).trim();
                     if (requiredPassword != null && requiredPassword.equals(suppliedPassword)) {
                         authenticated = true;
@@ -128,77 +114,46 @@ public class AeroServer {
                     continue;
                 }
 
-                // 🛡️ Delimiter Fix: Parse key, payload, and optional TTL safely
-                if ("SET".equals(command) || "PUT".equals(command)) {
-                    int secondComma = line.indexOf(',', firstComma + 1);
-                    if (secondComma == -1) {
-                        out.println("ERR_SYNTAX_ERROR");
-                        out.flush();
-                        continue;
-                    }
-
-                    String key = line.substring(firstComma + 1, secondComma).trim();
-                    int lastComma = line.lastIndexOf(',');
-
-                    String val;
-                    long ttl = 0;
-
-                    if (lastComma > secondComma) {
-                        String possibleTTL = line.substring(lastComma + 1).trim();
-                        try {
-                            ttl = Long.parseLong(possibleTTL);
-                            val = line.substring(secondComma + 1, lastComma).trim();
-                        } catch (NumberFormatException e) {
-                            // Last token is not a number; whole trailing text is the value
-                            val = line.substring(secondComma + 1).trim();
-                        }
-                    } else {
-                        val = line.substring(secondComma + 1).trim();
-                    }
-
-                    if (val.getBytes(StandardCharsets.UTF_8).length > MAX_VALUE_BYTES) {
-                        out.println("ERR_VALUE_TOO_LARGE");
-                        out.flush();
-                        continue;
-                    }
-
-                    AeroTTLEntry entry = new AeroTTLEntry(val, ttl);
-                    cache.put(key, entry);
-                    wal.logPut(key, val);
+                if (AeroCommand.SET.equals(command) || AeroCommand.PUT.equals(command)) {
+                    handleSet(line, firstComma, out);
+                }
+                else if (AeroCommand.HOLD.equals(command)) {
+                    handleHold(line, firstComma, out);
+                }
+                else if (AeroCommand.MHOLD.equals(command)) {
+                    handleMultiHold(line, firstComma, out);
+                }
+                else if (AeroCommand.RELEASE.equals(command)) {
+                    String key = line.substring(firstComma + 1).trim();
+                    cache.release(key);
+                    wal.logDelete(key);
                     out.println("OK");
                     out.flush();
                 }
-                else if ("DEL".equals(command) || "DELETE".equals(command)) {
+                else if (AeroCommand.DEL.equals(command) || AeroCommand.DELETE.equals(command)) {
                     String key = line.substring(firstComma + 1).trim();
                     cache.remove(key);
                     wal.logDelete(key);
                     out.println("OK");
                     out.flush();
                 }
-                else if ("GET".equals(command)) {
+                else if (AeroCommand.GET.equals(command)) {
                     String key = line.substring(firstComma + 1).trim();
-                    Object rawEntry = cache.get(key);
-
-                    if (rawEntry instanceof AeroTTLEntry) {
-                        AeroTTLEntry entry = (AeroTTLEntry) rawEntry;
-                        if (entry.isExpired()) {
-                            cache.remove(key);
-                            out.println("ERR_EXPIRED");
-                        } else {
-                            out.println("VALUE, " + entry.getValue());
-                        }
+                    Object val = cache.get(key);
+                    if (val != null) {
+                        out.println("VALUE, " + val);
                     } else {
                         out.println("ERR_NOT_FOUND");
                     }
                     out.flush();
-                } 
+                }
                 else {
                     out.println("ERR_UNKNOWN_COMMAND");
                     out.flush();
                 }
             }
         } catch (SocketTimeoutException e) {
-            // Idle client timed out: connection closes so thread returns to pool
+            // Idle client timed out: connection closes so its virtual thread ends
         } catch (IOException e) {
             // Client disconnected
         } finally {
@@ -206,6 +161,130 @@ public class AeroServer {
                 socket.close();
             } catch (IOException ignored) {}
         }
+    }
+
+    // SET,key,value[,ttlMillis] — unconditional write, always overwrites.
+    private void handleSet(String line, int firstComma, PrintWriter out) {
+        int secondComma = line.indexOf(',', firstComma + 1);
+        if (secondComma == -1) {
+            out.println("ERR_SYNTAX_ERROR");
+            out.flush();
+            return;
+        }
+
+        String key = line.substring(firstComma + 1, secondComma).trim();
+        String[] valAndTtl = splitValueAndTtl(line, secondComma);
+        String val = valAndTtl[0];
+        long ttl = Long.parseLong(valAndTtl[1]);
+
+        if (val.getBytes(StandardCharsets.UTF_8).length > MAX_VALUE_BYTES) {
+            out.println("ERR_VALUE_TOO_LARGE");
+            out.flush();
+            return;
+        }
+
+        boolean inserted = cache.put(key, val, ttl);
+        if (!inserted) {
+            out.println("ERR_CAPACITY");
+        } else {
+            wal.logPut(key, val, expiresAt(ttl));
+            out.println("OK");
+        }
+        out.flush();
+    }
+
+    // HOLD,key,value,ttlMillis — atomic acquire: succeeds only if key isn't already live-held.
+    private void handleHold(String line, int firstComma, PrintWriter out) {
+        int secondComma = line.indexOf(',', firstComma + 1);
+        if (secondComma == -1) {
+            out.println("ERR_SYNTAX_ERROR");
+            out.flush();
+            return;
+        }
+
+        String key = line.substring(firstComma + 1, secondComma).trim();
+        String[] valAndTtl = splitValueAndTtl(line, secondComma);
+        String val = valAndTtl[0];
+        long ttl = Long.parseLong(valAndTtl[1]);
+
+        if (val.getBytes(StandardCharsets.UTF_8).length > MAX_VALUE_BYTES) {
+            out.println("ERR_VALUE_TOO_LARGE");
+            out.flush();
+            return;
+        }
+
+        HoldResult result = cache.putIfAbsent(key, val, ttl);
+        respondToHoldResult(result, () -> wal.logPut(key, val, expiresAt(ttl)), out);
+    }
+
+    // MHOLD,key1|key2|key3,value,ttlMillis — all-or-nothing multi-key acquire.
+    private void handleMultiHold(String line, int firstComma, PrintWriter out) {
+        int secondComma = line.indexOf(',', firstComma + 1);
+        if (secondComma == -1) {
+            out.println("ERR_SYNTAX_ERROR");
+            out.flush();
+            return;
+        }
+
+        String keyList = line.substring(firstComma + 1, secondComma).trim();
+        List<String> keys = Arrays.asList(keyList.split(AeroCommand.MULTI_KEY_SEPARATOR));
+        if (keys.isEmpty() || keys.stream().anyMatch(String::isBlank)) {
+            out.println("ERR_SYNTAX_ERROR");
+            out.flush();
+            return;
+        }
+
+        String[] valAndTtl = splitValueAndTtl(line, secondComma);
+        String val = valAndTtl[0];
+        long ttl = Long.parseLong(valAndTtl[1]);
+
+        if (val.getBytes(StandardCharsets.UTF_8).length > MAX_VALUE_BYTES) {
+            out.println("ERR_VALUE_TOO_LARGE");
+            out.flush();
+            return;
+        }
+
+        HoldResult result = cache.holdAll(keys, val, ttl);
+        long expiresAtMillis = expiresAt(ttl);
+        respondToHoldResult(result, () -> {
+            for (String key : keys) wal.logPut(key, val, expiresAtMillis);
+        }, out);
+    }
+
+    private void respondToHoldResult(HoldResult result, Runnable onAcquired, PrintWriter out) {
+        switch (result) {
+            case ACQUIRED -> {
+                onAcquired.run();
+                out.println("OK");
+            }
+            case CONFLICT -> out.println("ERR_CONFLICT");
+            case CAPACITY_EXCEEDED -> out.println("ERR_CAPACITY");
+        }
+        out.flush();
+    }
+
+    private static long expiresAt(long ttlMillis) {
+        return ttlMillis > 0 ? System.currentTimeMillis() + ttlMillis : -1;
+    }
+
+    /**
+     * Splits "...,value[,ttlMillis]" starting after secondComma into
+     * {value, ttlMillisAsString}. If the trailing token isn't a number,
+     * it's treated as part of the value and ttl defaults to "0" (never
+     * expires) — same delimiter-safe parsing SET has always used.
+     */
+    private static String[] splitValueAndTtl(String line, int secondComma) {
+        int lastComma = line.lastIndexOf(',');
+        if (lastComma > secondComma) {
+            String possibleTtl = line.substring(lastComma + 1).trim();
+            try {
+                Long.parseLong(possibleTtl);
+                return new String[] { line.substring(secondComma + 1, lastComma).trim(), possibleTtl };
+            } catch (NumberFormatException e) {
+                // falls through to treat the whole trailing text as the value
+            }
+        }
+        return new String[] { line.substring(secondComma + 1).trim(), "0" };
     }
 
     public void stop() throws IOException {

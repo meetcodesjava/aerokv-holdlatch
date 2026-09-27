@@ -1,6 +1,10 @@
 package day03;
 
 import day02.AeroMap;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Predicate;
 
 public class AeroLRU {
     private final int capacity;
@@ -24,22 +28,31 @@ public class AeroLRU {
         return node.val;
     }
 
-    public void put(String key, Object val) {
+    /**
+     * Inserts/updates a key. When inserting a brand-new key into a full
+     * cache, evicts the least-recently-used entry that satisfies
+     * isEvictable (skipping past any that don't, e.g. a still-live hold).
+     * Returns false without inserting if the cache is full and no entry
+     * satisfies isEvictable - callers decide how to handle that (e.g.
+     * reject the write rather than silently corrupting a live entry).
+     */
+    public boolean put(String key, Object val, Predicate<Object> isEvictable) {
         LRUNode existingNode = (LRUNode) map.get(key);
         if (existingNode != null) {
-            // Update existing node without changing size or creating duplicates
             existingNode.val = val;
             moveToHead(existingNode);
-        } else {
-            // Only runs when key is completely new
-            if (size >= capacity) {
-                evictTail();
-            }
-            LRUNode newNode = new LRUNode(key, val);
-            addToHead(newNode);
-            map.put(key, newNode);
-            size++;
+            return true;
         }
+
+        if (size >= capacity && evictFirstMatching(isEvictable) == null) {
+            return false;
+        }
+
+        LRUNode newNode = new LRUNode(key, val);
+        addToHead(newNode);
+        map.put(key, newNode);
+        size++;
+        return true;
     }
 
     public void remove(String key) {
@@ -84,13 +97,27 @@ public class AeroLRU {
         addToHead(node);
     }
 
-    private void evictTail() {
-        if (tail == null) {
-            return;
+    /**
+     * Scans from the least-recently-used end and evicts the first node
+     * whose value satisfies isEvictable, returning its key/value - or null
+     * if nothing in the whole list matches (e.g. every entry is a live,
+     * non-expired hold). A live entry is skipped rather than evicted, so
+     * it is never silently dropped to make room for something else.
+     */
+    public Map.Entry<String, Object> evictFirstMatching(Predicate<Object> isEvictable) {
+        LRUNode curr = tail;
+        while (curr != null) {
+            if (isEvictable.test(curr.val)) {
+                String key = curr.key;
+                Object val = curr.val;
+                removeNode(curr);
+                map.put(key, null);
+                size--;
+                return Map.entry(key, val);
+            }
+            curr = curr.prev;
         }
-        map.put(tail.key, null);
-        removeNode(tail);
-        size--;
+        return null;
     }
 
     public int getSize() {
@@ -123,11 +150,11 @@ public class AeroLRU {
      * compaction. Not safe to call concurrently with writers; callers must
      * only use this while traffic is quiesced (e.g. startup/shutdown).
      */
-    public java.util.List<java.util.Map.Entry<String, Object>> snapshotEntries() {
-        java.util.List<java.util.Map.Entry<String, Object>> list = new java.util.ArrayList<>(size);
+    public List<Map.Entry<String, Object>> snapshotEntries() {
+        List<Map.Entry<String, Object>> list = new ArrayList<>(size);
         LRUNode curr = head;
         while (curr != null) {
-            list.add(java.util.Map.entry(curr.key, curr.val));
+            list.add(Map.entry(curr.key, curr.val));
             curr = curr.next;
         }
         return list;
